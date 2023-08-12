@@ -1,9 +1,10 @@
 ﻿using Microsoft.EntityFrameworkCore;
 using RentApp_REST_api.Models;
+using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 
 namespace RentApp_REST_api.Data
 {
-    public class AppDbContext : DbContext
+    public class AppDbContext : IdentityDbContext
     {
         public AppDbContext(DbContextOptions<AppDbContext> options) : base(options)
         {
@@ -13,6 +14,10 @@ namespace RentApp_REST_api.Data
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
+            base.OnModelCreating(modelBuilder);
+
+            modelBuilder.Entity<Car>().HasKey(c => c.Id);
+
             modelBuilder.Entity<Car>().HasData(
                 new Car()
                 {
