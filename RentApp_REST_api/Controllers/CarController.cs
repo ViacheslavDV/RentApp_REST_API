@@ -9,11 +9,11 @@ namespace RentApp_REST_api.Controllers
 {
     [ApiController]
     [Route("/api/cars")]
-    public class CarAPIController : ControllerBase
+    public class CarController : ControllerBase
     {
         private readonly AppDbContext _db;
 
-        public CarAPIController(AppDbContext db)
+        public CarController(AppDbContext db)
         {
             _db = db;
         }

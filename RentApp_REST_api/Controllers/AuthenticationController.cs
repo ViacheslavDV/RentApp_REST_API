@@ -1,13 +1,13 @@
 ﻿using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.IdentityModel.Tokens;
-using RentApp_REST_api.Configurations;
 using RentApp_REST_api.Models;
 using RentApp_REST_api.Models.Dto;
 using System.IdentityModel.Tokens.Jwt;
 using System.Text;
 using System.Security.Claims;
 using Microsoft.Extensions.Logging;
+using RentApp_REST_api.Data;
 
 namespace RentApp_REST_api.Controllers
 {
@@ -17,16 +17,22 @@ namespace RentApp_REST_api.Controllers
     {
         private readonly UserManager<IdentityUser> _userManager;
         private readonly IConfiguration _configuration;
+        private readonly AppDbContext _dbContext;
+        private readonly TokenValidationParameters _tokenValidationParameters;
         private readonly ILogger<AuthenticationController> _logger;
 
         public AuthenticationController(
             UserManager<IdentityUser> userManager, 
             IConfiguration configuration,
+            AppDbContext dbContext,
+            TokenValidationParameters tokenValidationParameters,
             ILogger<AuthenticationController> logger
             )
         {
             _userManager = userManager;
             _configuration = configuration;
+            _dbContext = dbContext;
+            _tokenValidationParameters = tokenValidationParameters;
             _logger = logger;
         }
 
@@ -60,12 +66,9 @@ namespace RentApp_REST_api.Controllers
                 if (is_created.Succeeded)
                 {
                     _logger.LogInformation("User created successfully.");
-                    var token = GenerateJwtToken(new_user);
+                    var jwtToken = await GenerateJwtToken(new_user);
 
-                    return Ok(new AuthResult(){
-                        Result = true,
-                        Token = token
-                    });
+                    return Ok(jwtToken);
                 }
                 else
                 {
@@ -118,13 +121,9 @@ namespace RentApp_REST_api.Controllers
                     });
                 }
 
-                var jwtToken = GenerateJwtToken(existing_user);
+                var jwtToken = await GenerateJwtToken(existing_user);
 
-                return Ok(new AuthResult()
-                {
-                    Token = jwtToken,
-                    Result = true
-                });
+                return Ok(jwtToken);
             }
 
             return BadRequest(new AuthResult()
@@ -137,7 +136,7 @@ namespace RentApp_REST_api.Controllers
             });
         }
 
-        private string GenerateJwtToken(IdentityUser user)
+        private async Task<AuthResult> GenerateJwtToken(IdentityUser user)
         {
             var jwtTokenHandler = new JwtSecurityTokenHandler();
 
@@ -154,13 +153,180 @@ namespace RentApp_REST_api.Controllers
                     new Claim(JwtRegisteredClaimNames.Iat, DateTime.Now.ToUniversalTime().ToString()),
                 }),
 
-                Expires = DateTime.Now.AddMinutes(30),
-
+                Expires = DateTime.UtcNow.Add(TimeSpan.Parse(_configuration.GetSection("JwtConfig:ExpireTimeRate").Value)),
                 SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256),
             };
 
             var token = jwtTokenHandler.CreateToken(tokenDescriptor);
-            return jwtTokenHandler.WriteToken(token);          
+            var jwtToken = jwtTokenHandler.WriteToken(token);
+
+            var refreshToken = new RefreshTokens()
+            {
+                JwtId = token.Id,
+                Token = RandomStringGenerator(23),
+                AddedDate = DateTime.UtcNow,
+                ExpireDate = DateTime.UtcNow.AddDays(7),
+                IsRevoked = false,
+                IsUsed = false,
+                userId = user.Id,
+            };
+
+            await _dbContext.RefreshTokens.AddAsync(refreshToken);
+            await _dbContext.SaveChangesAsync();
+
+            return new AuthResult()
+            {
+                Token = jwtToken,
+                RefreshToken = refreshToken.Token,
+                Result = true
+            };
+        }
+
+        [HttpPost("refresh-token")]
+        public async Task<IActionResult> RefreshToken([FromBody] TokenRequestDTO tokenRequestDto)
+        {
+            if (ModelState.IsValid)
+            {
+                var result = await VerifyAndGenerateToken(tokenRequestDto);
+
+                if(result == null)
+                {
+                    return BadRequest(new AuthResult()
+                    {
+                        Errors = new List<string>()
+                {
+                    "Invalid tokens"
+                },
+                        Result = false
+                    });
+                }
+
+                return Ok(result);
+            }
+
+            return BadRequest(new AuthResult()
+            {
+                Errors = new List<string>()
+                {
+                    "Invalid parameters"
+                },
+                Result = false
+            });
+        }
+
+        private async Task<AuthResult> VerifyAndGenerateToken(TokenRequestDTO tokenRequestDto)
+        {
+            var jwtTokenHandler =  new JwtSecurityTokenHandler();
+
+            try
+            {
+                _tokenValidationParameters.ValidateLifetime = false;
+                var tokenInVerification = 
+                    jwtTokenHandler.ValidateToken(tokenRequestDto.Token, _tokenValidationParameters, out var validatedToken);
+
+                if(validatedToken is JwtSecurityToken jwtSecurityToken)
+                {
+                    var result = jwtSecurityToken.Header.Alg.Equals(SecurityAlgorithms.HmacSha256,
+                        StringComparison.InvariantCultureIgnoreCase);
+
+                    if(result == false)
+                    {
+                        return null;
+                    }
+                }
+
+                var utcExpireDate = long.Parse(tokenInVerification.Claims.FirstOrDefault(x =>
+                x.Type == JwtRegisteredClaimNames.Exp).Value);
+
+                var expireDate = UnixTimeStampToDateTime(utcExpireDate);
+
+                if(expireDate > DateTime.Now)
+                {
+                    return new AuthResult()
+                    {
+                        Result = false,
+                        Errors = new List<string>()
+                        {
+                            "Expired token"
+                        }
+                    };
+                }
+
+                var storedToken = _dbContext.RefreshTokens.FirstOrDefault(x => x.Token == tokenRequestDto.RefreshToken);
+
+                if(storedToken == null || storedToken.IsUsed || storedToken.IsRevoked)
+                {
+                    return new AuthResult()
+                    {
+                        Result = false,
+                        Errors = new List<string>()
+                        {
+                            "Invalid tokens"
+                        }
+                    };
+                }
+
+                var jti = tokenInVerification.Claims.FirstOrDefault(x => x.Type == JwtRegisteredClaimNames.Jti).Value;
+
+                if(storedToken.JwtId != jti)
+                {
+                    return new AuthResult()
+                    {
+                        Result = false,
+                        Errors = new List<string>()
+                        {
+                            "Invalid tokens"
+                        }
+                    };
+                }
+
+                if(storedToken.ExpireDate < DateTime.UtcNow)
+                {
+                    return new AuthResult()
+                    {
+                        Result = false,
+                        Errors = new List<string>()
+                        {
+                            "Expired tokens"
+                        }
+                    };
+                }
+
+                storedToken.IsUsed = true;
+                _dbContext.RefreshTokens.Update(storedToken);
+                await _dbContext.SaveChangesAsync();
+
+                var dbUser = await _userManager.FindByIdAsync(storedToken.userId);
+
+                return await GenerateJwtToken(dbUser);
+            }
+            catch (Exception ex)
+            {
+                return new AuthResult()
+                {
+                    Result = false,
+                    Errors = new List<string>()
+                        {
+                            "Server Error"
+                        }
+                };
+            }
+        }
+
+        private static DateTime UnixTimeStampToDateTime(long unixTimeStamp)
+        {
+            var dateTimeValue = new DateTime(1970,1,1,0,0,0,0, DateTimeKind.Utc);
+
+            return dateTimeValue.AddSeconds(unixTimeStamp).ToUniversalTime();
+        }
+
+        private static string RandomStringGenerator(int length)
+        {
+            var random = new Random();
+            string chars = "QWERTYUIOPASDFGHJKLZXCVBNM1234567890qwertyuiopasdfghjklzxcvbnm";
+
+            return new string(Enumerable.Repeat(chars, length)
+                .Select(s => s[random.Next(s.Length)]).ToArray());
         }
     }
 }
